@@ -1,0 +1,1227 @@
+---
+title: "Prediction_analysis"
+author: "Qian Du"
+date: "11/9/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/home/qiandu/survival_analysis")
+```
+# Variables explanation 
+```{r}
+
+# r$pred$data$response -- The coxph model predict some sort of orderable risk (mean ofthe estimated cumulative hazard function). gbm.predict Returns a vector of predictions. By default the predictions are on the scale of f(x). For example, for the Bernoulli loss the returned value is on the log odds scale, poisson loss on the log scale, and coxph is on the log hazard scale. Here, it should be log risk score since risk_rank are all negative.
+
+```
+
+# Module 0: Library and function
+```{r}
+library("xlsx")
+library("stringi")
+library("colorspace")
+library("stringr")
+library("glmnet")
+library("superpc")
+library("survival")
+library("survcomp")
+library("survminer")
+library("caret")
+library("corrplot")
+library("pheatmap")
+library("gplots")
+library("gridGraphics")
+library("grid")
+library("plotrix")
+library("forestplot")
+library("fbroc")
+library("readxl")
+library("graphics")
+library("vcd")
+library("foreign")
+#library("tidyverse")
+library("gridExtra")
+library("ggfortify")
+library("data.table")
+library("cranlogs")
+library("mlr")
+#library("PMCMRplus")
+source("/home/qiandu/survival_analysis/Funtion_survival.R")
+```
+# Module 1: Raw data and evaluation
+```{r Load in indepedent variables}
+# Original data is from "https://app.box.com/folder/51899717753", directory "PancreasRadiomics" from Dr.Zheng
+# sample 78 is removed since we don't know whether or not he is still alive. If alive, he lives more than 5 years, which is not reasonable
+NameList = scan("Rawdata/NameList.txt",what="") # 74 samples
+VarMa0 = read_excel("Rawdata/P1.xlsx",sheet=1)
+VarMa = VarMa0[-c(1:12),]
+Var_Rname = apply(VarMa,1,function(x) paste0(x[1:3],collapse = "_"))
+# name of all independent variables
+Var_RnameV = as.vector(sapply(Var_Rname,function(x) str_replace_all(x,"-","_"))) 
+# extract data from all patients and integrate into one matrix
+for(i in 2:length(NameList)){
+  NameF0 = read_excel(paste0("Rawdata/",NameList[i]),sheet = 1)
+  NameF = NameF0[-c(1:12),]
+  check_name = as.vector(unlist(apply(NameF,1,function(x) paste0(x[1:3],collapse = "_"))))
+  if(!identical(check_name,Var_Rname)){
+    print("Warning! Not Identical!\n")
+    print(NameList[i])
+  }
+  VarMa = cbind(VarMa,NameF[,4]) 
+}
+# rownames
+VarMat = VarMa[,c(-1,-2,-3)]
+rownames(VarMat) = Var_RnameV
+# colnames
+nm_plus_ancest_split <- strsplit(NameList, ".",fixed = TRUE)
+colnames(VarMat) <- sapply(nm_plus_ancest_split, "[", 1)
+colnames(VarMat) <- as.numeric(substring(colnames(VarMat),2))
+VarMat = as.matrix(VarMat)
+storage.mode(VarMat) = "numeric"
+```
+```{r load in dependent variables}
+DepMa = as.matrix(read_excel("Raw/Pancreas SBRT patient databaseUpdatedNov2018.xlsx",sheet = 1))[-c(1,2,81),c(1,21:22,20,16,11:15)]
+DepMa1 = DepMa[match(colnames(VarMat),DepMa[,1]),]
+# for those alive people, we just assumed that they live to today as no death report found online
+# for patient 78, he lives extremely long and we just remove this patient
+DepMa1[,4] = ifelse(is.na(as.numeric(DepMa1[,4])),0,1)
+DepMa1[,5] = ifelse(DepMa1[,5]=="None","NR",ifelse(DepMa1[,5]=="unknown",NA,"YR"))
+DepMa1[,6] = ifelse(DepMa1[,6]=="M",1,0)
+DepMat = data.frame(as.numeric(DepMa1[,1]),as.numeric(DepMa1[,2]),as.numeric(DepMa1[,3]),as.numeric(DepMa1[,4]),DepMa1[,5],as.numeric(DepMa1[,6]),DepMa1[,7],as.numeric(DepMa1[,8]),as.numeric(DepMa1[,9]),as.numeric(DepMa1[,10]))
+colnames(DepMat) = c("Patient_ID","OS_Dx","OS_RT","Event","Local_recurrence","Gender","Location","T","N","M")
+
+Resection = as.matrix(read_excel("Pancreas SBRT patient databaseUpdatedJan2020.xlsx",sheet = 1))[c(3:80),c(1,4)]
+DepMat = data.frame(DepMat,Resection = Resection[match(DepMat[,1],Resection[,1]),2])
+
+```
+```{r Data storage, file used for the final analysis}
+save(VarMat,DepMat,file="Input_Resection.RData.RData")
+```
+```{r commnet}
+Comment: With this small dataset, keep the following things in mind
+1. Overfitting. With only a few data, the risk to overfit your model is far higher.
+2. Outliers. Those become nastier. If you have millions of data, a couple of outliers will not be a problem. But with only a few, they will definitely skew your results.
+What you need to do with small dataset
+1. I cleaned the data: remove one wierd sample and replace outliers with sample mean. I will pay attention to how the result would be affected by specific samples or variables
+2. ust traditional statistic method instead of machine learning. Keep your model simple, as I have around 70 deaths, the final model will include no more 7 variables. Try both cox hazard model or wellbull model and compare
+3. use regularization instead of stepwise,NNG
+4. do model averaging using bagging or bayesian model average
+5. initial analysis using all samples (univariate->correlation->stepwise/lasso) to get some basic sense about the data and the performance of the model, the performance c-index is around 0.613 which suggests that your final model will not have a very good performance. The univariate fitting could also get us some idea about those features. Here, I just did not performance initial analysis for classification.
+```
+```{r heatmap}
+load("Input_Resection.RData")
+# Dr. zhang ask for Z-score
+VarMat_map = scale(t(VarMat))
+VarMat_map[which(VarMat_map>3,arr.ind = T)] =3
+VarMat_map[which(VarMat_map<(-3),arr.ind = T)] =-3
+
+# my_palette <- colorRampPalette(c("royalblue1","green","yellow","red3"))(n=200)
+my_palette <- colorRampPalette(c("blue3","blue1","royalblue1","yellow","sandybrown","indianred3","red3"))(n=400)
+
+distance_M = "correlation"
+cluster_M ="ward.D"
+
+pdf("correlation_heatmap_temp1.pdf",width=12,height=12,onefile = F)
+pheatmap(t(VarMat_map),fontsize=8, fontsize_row=6,cluster_cols = T,cluster_rows = T,
+         clustering_distance_rows = distance_M, clustering_distance_cols = distance_M,
+         clustering_method = cluster_M,
+         annotation_names_row = F, annotation_names_col = F, TRUEborder_color = NA,
+         show_rownames=F,color=my_palette)
+dev.off()
+
+# get new col order
+distance    = Dist(VarMat_map,method=distance_M)
+cluster     = hclust(distance, method=cluster_M)
+dendrogram  = as.dendrogram(cluster)
+Order.seN = rownames(VarMat_map)[order.dendrogram(dendrogram)]
+
+# gender
+DepMat_map2 = as.numeric(as.vector(DepMat[match(Order.seN,DepMat[,1]),6]))
+DepMat_map2[DepMat_map2==0] = "white"
+DepMat_map2[DepMat_map2==1] = "lightsteelblue1"
+DepMat_map2[which(is.na(DepMat_map2))] = "lightsteelblue1"
+pdf(file="Gender.pdf")
+plotOrderedColors(c(1:74),DepMat_map2)
+dev.off()
+
+# Site
+DepMat_map5 = as.vector(DepMat[match(Order.seN,DepMat[,1]),7])
+DepMat_map5[DepMat_map5=="Head"] = "white"
+DepMat_map5[DepMat_map5=="Neck"] = "lightsteelblue1"
+DepMat_map5[DepMat_map5=="Tail"] = "royalblue2"
+DepMat_map5[DepMat_map5=="Body"] = "blue3"
+DepMat_map5[DepMat_map5=="uncinate"] = "grey"
+DepMat_map5[which(is.na(DepMat_map5))] = "blue3"
+pdf(file="Site.pdf")
+plotOrderedColors(c(1:74),DepMat_map5)
+dev.off()
+
+# T
+DepMat_map6 = as.numeric(as.vector(DepMat[match(Order.seN,DepMat[,1]),8]))
+DepMat_map6[DepMat_map6==2] = "white"
+DepMat_map6[DepMat_map6==3] = "lightsteelblue1"
+DepMat_map6[DepMat_map6==4] = "royalblue2"
+DepMat_map6[which(is.na(DepMat_map6))] = "royalblue2"
+pdf(file="T.pdf")
+plotOrderedColors(c(1:74),DepMat_map6)
+dev.off()
+
+# N
+DepMat_map6 = as.numeric(as.vector(DepMat[match(Order.seN,DepMat[,1]),9]))
+DepMat_map6[DepMat_map6==0] = "white"
+DepMat_map6[DepMat_map6==1] = "lightsteelblue1"
+DepMat_map6[which(is.na(DepMat_map6))] = "lightsteelblue1"
+
+pdf(file="N.pdf")
+plotOrderedColors(c(1:74),DepMat_map6)
+dev.off()
+
+# Resection
+DepMat_map7 = as.vector(DepMat[match(Order.seN,DepMat[,1]),11])
+DepMat_map7[DepMat_map7=="N"] = "white"
+DepMat_map7[DepMat_map7=="Y"] = "lightsteelblue1"
+
+pdf(file="Resection.pdf")
+plotOrderedColors(c(1:74),DepMat_map7)
+dev.off()
+
+
+# statistical test among clusters
+Group.OrderA = c(rep("A",10),rep("B",27),rep("C",26),rep("D",11)) 
+# Gender  pval = 0.796
+gender.chiT = data.frame(a= DepMat[match(Order.seN,DepMat[,1]),6],b=Group.OrderA)
+chisq.test(table(gender.chiT$a,gender.chiT$b))$p.value
+
+# Location pval = 0.628
+gender.chiT = data.frame(a= DepMat[match(Order.seN,DepMat[,1]),7],b=Group.OrderA)
+chisq.test(table(gender.chiT$a,gender.chiT$b))$p.value
+
+# N 0.981
+gender.chiT = data.frame(a= DepMat[match(Order.seN,DepMat[,1]),9],b=Group.OrderA)
+chisq.test(table(gender.chiT$a,gender.chiT$b))$p.value
+
+# T 0.569
+gender.chiT = data.frame(a= DepMat[match(Order.seN,DepMat[,1]),8],b=Group.OrderA)
+chisq.test(table(gender.chiT$a,gender.chiT$b))$p.value
+
+# Resection 0.0485
+gender.chiT = data.frame(a= DepMat[match(Order.seN,DepMat[,1]),11],b=Group.OrderA)
+chisq.test(table(gender.chiT$a,gender.chiT$b))$p.value
+
+# table of patient info
+write.xlsx(DepMat,file="patient_info_pancreas.xlsx",row.names = F)
+
+# Comment: for right now, some R function could calculate the distance among samples with absolute value of correlation
+
+```
+# Module 2: model building and validation
+## Part 1: preparation for model building
+```{r load in dataset and library}
+library("survival")
+library("survcomp")
+library("mlr")
+library("parallelMap")
+library("parallel")
+library("magrittr")
+library("PRROC")
+library("ggplot2")
+library("readxl")
+library("dplyr")
+source("Funtion_survival.R")
+
+load("../InterData/Input_Resection.RData")
+VarMatS = data.frame(scale(t(VarMat)))
+```
+```{r univariate analysis for all data}
+alluni.data = data.frame(DepMat[,c(2,4,6:9,11)],VarMatS)
+alluni.data[,'Gender'] <- as.factor(alluni.data[,'Gender'])
+alluni.data[,'N'] <- as.factor(alluni.data[,'N'])
+alluni.data[,'T'] <- as.factor(alluni.data[,'T'])
+alluni.data[,'Location'] <- as.factor(alluni.data[,'Location'])
+alluni.data[,'Resection'] <- as.factor(alluni.data[,'Resection'])
+
+# univariate analysis with all samples
+# first: Gender Second: Location Third: T Fouth: N
+all_feature_CI = multiple_uni_cox(time = alluni.data$OS_Dx,status = alluni.data$Event, alluni.data[,-c(1,2)])
+uni_radio = t(as.data.frame(all_feature_CI[6:846], check.names = FALSE)) 
+save(all_feature_CI,uni_radio,file="AllData_univar.RData")
+```
+```{r Filter ano.cor.filter}
+makeFilter(
+  name = "uni.cor.filter",
+  desc = "univariate coxph + correlation",
+  pkg = character(0),
+  supported.tasks = c("classif", "regr", "surv"),
+  supported.features = c("numerics", "factors", "ordered"),
+  fun = function(task, nselect, decreasing = TRUE, ...) {
+    # univariate analysis
+    #uv = generateFilterValuesData(task,imp.learner=makeLearner("surv.coxph"),method="univariate.model.score")
+    #uv.list = uv$data$name[order(uv$data$univariate.model.score,decreasing = T)]
+    
+    uni_cox = multiple_uni_cox(time = getTaskData(task,target.extra = T)$target[,1],
+                               status = ifelse(getTaskData(task, target.extra = T)$target[,2],1,0),
+                               getTaskData(task,target.extra = T)$data)
+    res = t(as.data.frame(uni_cox[1:841], check.names = FALSE)) 
+    UniPval = res[,6]
+    UniPval1 = UniPval[UniPval<0.1] #75
+    storage.mode(UniPval1)="numeric"
+    uv.list = names(UniPval1)[order(UniPval1,decreasing = F)]
+    
+    sort.data = getTaskData(task,features = uv.list, target.extra = T)$data
+    sort.size = nrow(sort.data)
+    # keep one feature among correlated features
+    FT.name = colnames(RemoveCor(sort.data,0.8)) 
+    select.feature = FT.name
+    # output  
+    FT.value = c(length(select.feature):1,rep(0,getTaskNFeats(task)-length(select.feature)))
+    names(FT.value) = c(select.feature,setdiff(getTaskFeatureNames(task),select.feature))
+    print("Filtering processed.")
+    FT.value
+  }
+
+)
+```
+```{r Filter ano.cla.filter}
+makeFilter(
+  name = "ano.cla.filter",
+  desc = "multiple anova + correlation selection",
+  pkg = character(0),
+  supported.tasks = c("classif", "regr", "surv"),
+  supported.features = c("numerics", "factors", "ordered"),
+  fun = function(task, nselect, decreasing = TRUE, ...) {
+    # multiple annova
+    UniPval = multiple_uni_anova(getTaskData(task,target.extra = T)$data,getTaskData(task,target.extra = T)$target)
+
+    UniPval1 = UniPval[UniPval<0.1] #75
+    storage.mode(UniPval1)="numeric"
+    uv.list = names(UniPval1)[order(UniPval1,decreasing = F)]
+    
+    sort.data = getTaskData(task,features = uv.list, target.extra = T)$data
+    # keep one feature among correlated features
+    FT.name = colnames(RemoveCor(sort.data,0.8)) 
+    select.feature = FT.name
+    print(length(select.feature))
+    # output  
+    FT.value = c(length(select.feature):1,rep(0,getTaskNFeats(task)-length(select.feature)))
+    names(FT.value) = c(select.feature,setdiff(getTaskFeatureNames(task),select.feature))
+    print("I am here.")
+    FT.value
+  }
+
+)
+```
+```{r Filter cutoff.filter}
+library("mlr")
+cutoff = makeFilter(
+  name = "cutoff",
+  desc = "determine the optical number of features included in the final model",
+  pkg = character(0),
+  supported.tasks = c("classif", "regr", "surv"),
+  supported.features = c("numerics", "factors", "ordered"),
+  fun = function(task, nselect, decreasing = TRUE, ...) {
+    
+    feature.name = getTaskFeatureNames(task)
+    feature.value = c(length(feature.name):1)
+    names(feature.value) = feature.name
+  
+    feature.value
+  }
+
+)
+```
+```{r Assessment PRAUC}
+### Define a function that calculates the misclassification rate
+prauc.fun = function(task, model, pred, feats, extra.args) {
+# the function doesn't work for predict.type="both"
+  pr.roc <- pr.curve(scores.class0 = pred$data[,match(paste0("prob.",pred$task.desc$positive),colnames(pred$data))], weights.class0 = ifelse(pred$data[,2]==pred$task.desc$positive,1,0), curve = F)
+  pr.roc$auc.davis.goadrich
+}
+### Generate the Measure object
+prauc = makeMeasure(
+id = "prauc", name = "area under precision-recall curve",
+properties = c("classif", "classif.multi", "req.pred",
+"req.truth"),
+minimize = F, best = 1, worst = 0,
+fun = prauc.fun
+)
+
+```
+```{r Functions useful for evaluation}
+# 1.parameter tuning path_could be used to pick up parameter range used for tuning
+opt.paths = getNestedTuneResultsOptPathDf(r)
+
+pdf(file="Parameter_tuning_process11.pdf")
+g = ggplot(opt.paths, aes(x = fw.abs, y = n.trees, fill =
+cindex.test.mean))
+g + geom_tile() + facet_wrap(~ iter)
+dev.off()
+
+# 2. codes used for quick pre-tuning
+
+test = mean(r$measures.test$cindex)
+pdf("test.pdf")
+plot(10:1500,lapply(10:1500,function(x) {sd(r$measures.test$cindex[10:x])}))
+dev.off()
+
+# 2.2
+for(j in 4:15){
+
+surv.data = data.frame(DepMat[,c(2,4)],VarMatS[,colnames(VarMatS)%in%FT.name[1:j]])
+surv.task = makeSurvTask(data = surv.data, target = c("OS_Dx","Event"))
+
+lrn = setHyperPars(makeLearner("surv.gbm"), par.vals = list(n.minobsinnode = 3, n.trees = 400,interaction.depth = 1,bag.fraction = 0.85))
+r = resample(lrn, surv.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=200L),
+             #extract=getTuneResult, 
+             models = F, show.info = F)
+print(r$aggr)
+}
+
+```
+## Part 2: machine learning-final version-regression
+```{r regression_feature_selection}
+# I. initial feature selection with univariate.model.score, correlation and forward selection
+repeat.i = function(i){
+  trainID = sample(1:nrow(VarMatS),50)
+  traindata = surv.data[trainID,]
+  # initial fitlering
+  ini.task = makeSurvTask(data =traindata, target = c("OS_Dx","Event"))
+  filtered.Name = filterFeatures(ini.task, method = "uni.cor.filter", threshold = 0.5)%>%getTaskFeatureNames()
+  # forward selection
+  sel.task = makeSurvTask(data =surv.data[,c("OS_Dx","Event",filtered.Name)], target = c("OS_Dx","Event"))
+  
+  lrn = setHyperPars(makeLearner("surv.gbm"), n.minobsinnode = 4)
+  #lrn = setHyperPars(makeLearner("surv.gbm"), par.vals = list(n.minobsinnode = 3, n.trees = 400,interaction.depth = 1,bag.fraction = 0.85))
+  
+  sel.fea = selectFeatures(learner = lrn, task = sel.task, 
+                           resampling = makeFixedHoldoutInstance(train.inds = trainID, test.inds = trainID, size = nrow(VarMatS)),
+                           control = makeFeatSelControlSequential(method = "sffs",alpha = 0.01), 
+                           show.info = F)
+  
+  return(sel.fea$x)
+}
+
+surv.data = data.frame(DepMat[,c(2,4)],VarMatS)
+numCores <- detectCores() # get the number of cores available
+set.seed(14325)
+fea.list = mclapply(1:1000, repeat.i, mc.cores = numCores)
+
+
+FT.name = names(sort(table(unlist(fea.list)),decreasing = T))
+save(fea.list,file="regression_feature_selection_nmin4.RData")
+# FT.name = colnames(RemoveCor(VarMatS[,test],0.8))  # there's almost no correlation among features ranked top 
+```
+```{r A regression clinic}
+# 1. data preparation
+cli.data = data.frame(DepMat[,c(2,4)],DepMat[,c(6:9,11)])
+# cli.data[,5] = 10^cli.data[,5]+rnorm(nrow(cli.data),0,1) # this is to avoid crash down of gbm with R
+cli.data[,'N'] <- as.factor(cli.data[,'N'])
+cli.data[,'Location'] <- as.factor(cli.data[,'Location'])
+cli.data[,'Resection'] <- ifelse(cli.data[,'Resection']=="Y",1,0)
+# cli.data[,7] = 10^cli.data[,7]+rnorm(nrow(cli.data),0,1) # this is to avoid crash down of gbm with R
+cli.task = makeSurvTask(data = data.frame(cli.data),target = c("OS_Dx","Event"))
+
+# 2. fast tuning
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+lrn = makeLearner("surv.gbm")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(30,50,100)),
+                  makeDiscreteParam("shrinkage", values = c(0.001,0.0001)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(3)),
+                  makeDiscreteParam("bag.fraction", values = c(0.9))
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=200L, predict="both")
+res = tuneParams(lrn, task = cli.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(cindex,setAggregation(cindex,test.sd)))
+parallelStop()
+
+
+# 3. fit the model
+
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+lrn = makeLearner("surv.gbm")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      resampling = makeResampleDesc("RepCV",folds=3L,reps=100L),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(30,50,70)),
+                        makeDiscreteParam("shrinkage", values = c(0.001,0.0001)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(3)),
+                        makeDiscreteParam("bag.fraction", values = c(0.9))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+r = resample(lrn1, cli.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L),
+             extract=getTuneResult, 
+             models = T)
+parallelStop()
+
+reg.cli.r = r
+save(reg.cli.r,file="regression_clinic.RData")
+
+```
+```{r B regression clinic radiomic}
+# II. model evaluation 
+load("../Interdata/regression_feature_selection_nmin4.RData")
+FT.name = names(sort(table(unlist(fea.list)),decreasing = T))
+surv.data = data.frame(DepMat[,c(2,4,6:9,11)],VarMatS[,FT.name])
+surv.data[,'N'] <- as.factor(surv.data[,'N'])
+surv.data[,'Location'] <- as.factor(surv.data[,'Location'])
+surv.data[,'Resection'] <- ifelse(surv.data[,'Resection']=="Y",1,0)
+
+surv.task = makeSurvTask(data = surv.data, target = c("OS_Dx","Event"))
+
+## fast tuning
+set.seed(14327,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14327)
+parallelLibrary("mlr")
+parallelSource("cutoff.R")
+lrn = makeFilterWrapper(makeLearner("surv.gbm"), fw.method = "cutoff")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(400,500,600)),
+                  makeDiscreteParam("shrinkage", values = c(0.1)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(3)),
+                  makeDiscreteParam("bag.fraction", values = c(0.9)),
+                  makeDiscreteParam("fw.abs", values = c(9:15))
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=100L)
+res = tuneParams(lrn, task = surv.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(cindex,setAggregation(cindex,test.sd)))
+parallelStop()
+
+# model
+set.seed(14327,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14327)
+parallelLibrary("mlr")
+parallelSource("../script/cutoff.R")
+lrn = makeFilterWrapper(makeLearner("surv.gbm"), fw.method = "cutoff")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      makeResampleDesc("RepCV",folds=3L,reps=100L),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(400, 500,600)),
+                        makeDiscreteParam("shrinkage", values = c(0.1)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(3)),
+                        makeDiscreteParam("bag.fraction", values = c(0.9)),
+                        makeDiscreteParam("fw.abs", values  = c(9:15))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+r = resample(lrn1, surv.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L, predict="both"),
+             extract=getTuneResult, 
+             models = T)
+parallelStop()
+
+
+# reg.cliran.r.fw = r
+# save(reg.cliran.r.fw ,file="regression_clinic_radio_FW.ABS.RData")
+reg.cliran.r = r
+save(reg.cliran.r,file="regression_clinic_radio.RData")
+# performance: 0.675
+
+# a. plot graphs
+# convergence
+CR.cindex = r$measures.test$cindex
+CR.mean = unlist(lapply(10:1500,function(x){mean(CR.cindex[1:x])}))
+CR.sd = unlist(lapply(10:1500,function(x){sd(CR.cindex[1:x])}))
+error95 = unlist(lapply(10:1500,function(x){qt(0.975,df=x-1)*CR.sd[x-9]/sqrt(x)}))
+
+pdf(file="regression_CR.pdf")
+plot(10:1500,CR.mean,type="l",xlab="Iterations",ylab="Concordance Index",ylim=c(0.6,0.7))
+lines(10:1500,CR.mean+error95,lty=2)
+lines(10:1500,CR.mean-error95,lty=2)
+dev.off()
+# b. Number of features included in the following model
+feaNO.summary = unlist(lapply(r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+6   7   8   9  10  11  12  13  14  15  16 
+18  23  33  21 778 380 130  43  31  23  20 
+```
+```{r C regression radiomic}
+# II. model evaluation 
+load("~/regression/regression_feature_selection_nmin4.RData")
+FT.name = names(sort(table(unlist(fea.list)),decreasing = T))
+
+surv.data = data.frame(DepMat[,c(2,4)],VarMatS[,FT.name])
+surv.task = makeSurvTask(data = surv.data, target = c("OS_Dx","Event"))
+
+## fast tuning
+set.seed(14327,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14327)
+parallelLibrary("mlr")
+parallelSource("cutoff.R")
+lrn = makeFilterWrapper(makeLearner("surv.gbm"), fw.method = "cutoff")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(400,500,600)),
+                  makeDiscreteParam("shrinkage", values = c(0.1)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(3)),
+                  makeDiscreteParam("bag.fraction", values = c(0.6,0.7,0.9)),
+                  makeDiscreteParam("fw.abs", values = c(2:8))
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=100L)
+res = tuneParams(lrn, task = surv.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(cindex,setAggregation(cindex,test.sd)))
+parallelStop()
+# generateHyperParsEffectData(res,partial.dep = T)
+
+## Proper tuning
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelSource("~/survival_analysis/cutoff.R")
+lrn = makeFilterWrapper(makeLearner("surv.gbm"), fw.method = "cutoff")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      makeResampleDesc("RepCV",folds=3L,reps=100L),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(400,500,600)),
+                        makeDiscreteParam("shrinkage", values = c(0.1)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(3)),
+                        makeDiscreteParam("bag.fraction", values = c(0.9)),
+                        makeDiscreteParam("fw.abs", values = c(2:8))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+
+r = resample(lrn1, surv.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L, predict="both"),
+             extract=getTuneResult, 
+             models = T)
+parallelStop()
+
+reg.ran.r = r
+save(reg.ran.r,file="regression_radio.RData")
+
+
+## summary
+feaNO.summary = unlist(lapply(r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+
+```
+```{r additional result}
+# Q1. how many features should be tuned 
+Q1. both n.minobsnnode =3 and n.minobsnnode = 10 give results below 0.63. I will just specify n.minobsinnode as 4. A reasonable way to pick up a good range for fw.abs is to take a look at the distribution of the picked features
+# variables
+ 8   9  10  11  12 
+138  34 726 225 377 
+# variables
+8   9  10  11  12  13  14  15  16  17  18  19  20 
+129  25 602 191 240  33  58  47  42  14  81  12  26 
+Comment: it seems impossible to use thise table to suggest the number of features should be tuned. Based on this result, 8-12 is a reasonable number. When using 20, performance drops to 0.641.
+```
+```{r A survival curve}
+# II. clinic model
+## plot by the average values
+load("regression_clinic.RData")
+
+reg.cli.bygroup = reg.cli.r$pred$data %>% filter(set=="test") %>% group_by(id) %>% summarize(time=mean(truth.time), response=mean(response), event=ifelse(mean(truth.event),TRUE,FALSE))
+cli.risk_mark = ifelse(reg.cli.bygroup$response>median(reg.cli.bygroup$response),0,1) # low risk as 1
+
+pdf(file="Test_survival_clinic_average.pdf",onefile=F)
+plot(survfit(Surv(reg.cli.bygroup$time, reg.cli.bygroup$event)~cli.risk_mark),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+# log-rant test statistics
+survdiff(Surv(reg.cli.bygroup$time, reg.cli.bygroup$event) ~ cli.risk_mark, rho=0) # train:    test: pval = 0.1
+
+
+## plot by overall values
+reg.cli.overall = reg.cli.r$pred$data %>% filter(set=="test")
+cli.risk_mark.overall = ifelse(reg.cli.overall$response>median(reg.cli.overall$response),0,1) # low risk as 1
+
+pdf(file="Test_survival_clinic_overall.pdf",onefile=F)
+plot(survfit(Surv(reg.cli.overall$truth.time, reg.cli.overall$truth.event)~cli.risk_mark.overall),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+
+# log-rant test statistics
+survdiff(Surv(reg.cli.overall$truth.time, reg.cli.overall$truth.event) ~ cli.risk_mark.overall, rho=0) # pval <2e-16
+
+
+```
+```{r B survival curve}
+# II. clinic_radiomic model
+## plot by the average values
+load("regression_clinic_radio.RData")
+
+
+reg.cliran.bygroup = reg.cliran.r$pred$data %>% filter(set=="test") %>% group_by(id) %>% summarize(time=mean(truth.time), response=mean(response), event=ifelse(mean(truth.event),TRUE,FALSE))
+cliran.risk_mark = ifelse(reg.cliran.bygroup$response>median(reg.cliran.bygroup$response),0,1) # low risk as 1
+
+pdf(file="Test_survival_clinic_radiomic_average.pdf",onefile=F)
+plot(survfit(Surv(reg.cliran.bygroup$time, reg.cliran.bygroup$event)~cliran.risk_mark),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+# log-rant test statistics
+survdiff(Surv(reg.cliran.bygroup$time, reg.cliran.bygroup$event) ~ cliran.risk_mark, rho=0) # pval <4e-5
+
+
+## plot by overall values
+reg.cliran.overall = reg.cliran.r$pred$data %>% filter(set=="train")
+cliran.risk_mark.overall = ifelse(reg.cliran.overall$response>median(reg.cliran.overall$response),0,1) # low risk as 1
+
+pdf(file="Test_survival_clinic_radiomic_overall.pdf",onefile=F)
+plot(survfit(Surv(reg.cliran.overall$truth.time, reg.cliran.overall$truth.event)~cliran.risk_mark.overall),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+
+# log-rant test statistics
+survdiff(Surv(reg.cliran.overall$truth.time, reg.cliran.overall$truth.event) ~ cliran.risk_mark.overall, rho=0) # pval <2e-16
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+```{r C survival curve}
+# II. clinic_radiomic model
+## plot by the average values
+load("regression_radio.RData")
+
+
+reg.ran.bygroup = reg.ran.r$pred$data %>% filter(set=="train") %>% group_by(id) %>% summarize(time=mean(truth.time), response=mean(response), event=ifelse(mean(truth.event),TRUE,FALSE))
+ran.risk_mark = ifelse(reg.ran.bygroup$response>median(reg.ran.bygroup$response),0,1) # low risk as 1
+
+pdf(file="Train_survival_radiomic_average.pdf",onefile=F)
+plot(survfit(Surv(reg.ran.bygroup$time, reg.ran.bygroup$event)~ran.risk_mark),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+# log-rant test statistics
+survdiff(Surv(reg.ran.bygroup$time, reg.ran.bygroup$event) ~ ran.risk_mark, rho=0) # Train: pval<2e-16   Test: pval = 3e-5
+
+
+## plot by overall values
+reg.ran.overall = reg.ran.r$pred$data %>% filter(set=="train")
+ran.risk_mark.overall = ifelse(reg.ran.overall$response>median(reg.ran.overall$response),0,1) # low risk as 1
+
+pdf(file="Train_survival_radiomic_overall.pdf",onefile=F)
+plot(survfit(Surv(reg.ran.overall$truth.time, reg.ran.overall$truth.event)~ran.risk_mark.overall),xlab="Time in days",ylab="Survival probability",col=c("red","blue"),lwd=3, mark="|")
+legend ("topright",legend =c ("High-Risk", "Low-Risk"),col=c("red","blue") , lwd =3)
+dev.off()
+
+# log-rant test statistics
+survdiff(Surv(reg.ran.overall$truth.time, reg.ran.overall$truth.event) ~ ran.risk_mark.overall, rho=0) # Train: pval<2e-16  Test: pval <2e-16
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```
+## Part 3: machine learning-final version-classification
+```{r Additional data processing for classification, NA as NR}
+DepMat[which(is.na(DepMat[,5])),5] = c("NR","NR","NR")
+class.dataA = data.frame(recur = DepMat[,5],VarMatS) # matrix with only radiomic features
+class.dataB = data.frame(recur = DepMat[,5],DepMat[,c(6:9,11)],VarMatS) # matrix with both radio+clinic
+colnames(class.dataB)[5] = "N"
+nsample = nrow(class.dataA)
+```
+```{r pre-evaluation of clinic features}
+# you can examine contigency table using the following code
+table(class.dataB[,c(1,3)])
+
+# independence test
+chisq.test(table(class.dataB[,c(1,2)]))$p.value   #0.332
+chisq.test(table(class.dataB[,c(1,3)]))$p.value   #0.682
+chisq.test(table(class.dataB[,c(1,4)]))$p.value
+chisq.test(table(class.dataB[,c(1,5)]))$p.value   #1
+chisq.test(table(class.dataB[,c(1,6)]))$p.value   #0.6066 
+# Comment: all are non-significant
+```
+```{r classificaiton_feature_selection}
+repeat.j = function(j){
+  
+  trainID = c(sample(which(class.dataA$recur=="NR"),33),sample(which(class.dataA$recur=="YR"),16))
+  traindata = class.dataA[trainID,]
+  # initial fitlering
+  ini.task = makeClassifTask(data =traindata, target = c("recur"))
+  
+ # tt<-tryCatch(filterFeatures(ini.task, method = "ano.cor.filter", threshold = 0.5),error=function(e) e, warning=function(w) w)
+ # while(is(tt,"error")){
+  #  print("Not work")
+   # trainID = c(sample(which(class.dataA$recur=="NR"),32),sample(which(class.dataA$recur=="YR"),18))
+  #  traindata = class.dataA[trainID,]
+#    ini.task = makeClassifTask(data =traindata, target = c("recur"))
+ #   tt<-tryCatch(filterFeatures(ini.task, method = "ano.cor.filter", threshold = 0.5),error=function(e) e, warning=function(w) w)
+#  }
+  
+  filtered.Name = filterFeatures(ini.task, method = "ano.cla.filter", threshold = 0.5)%>%getTaskFeatureNames()
+  # forward selection
+  sel.task = makeClassifTask(data =class.dataA[,c("recur",filtered.Name)], target = c("recur"))
+  
+  #lrn = makeLearner("classif.ksvm",predict.type = "prob")
+  
+  lrn = setHyperPars(makeLearner("classif.gbm",predict.type = "prob"), par.vals = list(distribution="bernoulli",n.minobsinnode = 10))
+  #lrn = setHyperPars(makeLearner("classif.gbm",predict.type = "prob"), par.vals = list(n.minobsinnode = 10, n.trees = 500,distribution="bernoulli",shrinkage = 0.01))
+  
+  sel.fea = selectFeatures(learner = lrn, task = sel.task, measures = list(auc),
+                           resampling = makeFixedHoldoutInstance(train.inds = trainID, test.inds = trainID, size = nsample),
+                           control = makeFeatSelControlSequential(method = "sffs",alpha = 0.01), 
+                           show.info = F)
+  
+  return(sel.fea$x)
+}
+
+numCores <- detectCores() # get the number of cores available
+set.seed(14325)
+feaC.list = mclapply(1:1000, repeat.j, mc.cores = numCores, mc.preschedule = FALSE)
+
+FTC.name = names(sort(table(unlist(feaC.list)),decreasing = T))[-197]
+save(feaC.list,file="classification_feature_selection_nmin10.RData")
+```
+```{r A classification clinic}
+# 1. data preparation
+cli.data = class.dataB[,1:6]
+
+cli.data[,'T'] <- as.factor(cli.data[,'T'])
+cli.data[,'Location'] <- as.factor(cli.data[,'Location'])
+cli.data[,'Resection'] <- ifelse(cli.data[,'Resection']=="Y",1,0)
+cli.task = makeClassifTask(data = cli.data,target = c("recur"), positive = "YR")
+
+# 2. fast tuning
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(35)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("prauc.R")
+
+lrn = makeLearner("classif.gbm",predict.type = "prob")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(100,300,500,700)),
+                  makeDiscreteParam("shrinkage", values = c(0.01,0.001)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(10)),
+                  makeDiscreteParam("bag.fraction", values = c(0.8))
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=100L,stratify = TRUE,predict="both")
+res = tuneParams(lrn, task = cli.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(auc))
+
+parallelStop()
+
+#prauc,setAggregation(prauc,test.sd)
+
+# 3. fit the model
+
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("~/survival_analysis/prauc.R")
+
+lrn = makeLearner("classif.gbm",predict.type = "prob")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      resampling = makeResampleDesc("RepCV",folds=3L,reps=100L,stratify = T),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(100,300,500,700)),
+                        makeDiscreteParam("shrinkage", values = c(0.01,0.001)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(10)),
+                        makeDiscreteParam("bag.fraction", values = c(0.8))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+r = resample(lrn1, cli.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L,stratify=T,predict="both"),
+             extract=getTuneResult, 
+             models = T,measures=list(auc,prauc))
+
+cla.cli.r = r
+save(cla.cli.r,file="classification_clinic_YRasPositive.RData")
+
+parallelStop()
+
+```
+```{r B classification clinic radiomic}
+load("~/classification/classification_feature_selection_nmin10_1000rounds.RData")
+FTC.name = names(sort(table(unlist(feaC.list)),decreasing = T))[-197]
+
+# 1. data preparation
+cliR.data = class.dataB[,c("recur","Gender","Location","T","N","Resection",FTC.name)]
+cliR.data[,'Gender'] <- as.factor(class.dataB[,'Gender'])
+cliR.data[,'N'] <- as.factor(class.dataB[,'N'])
+cliR.data[,'T'] <- as.factor(class.dataB[,'T'])
+cliR.data[,'Resection'] <- as.factor(class.dataB[,'Resection'])
+cliR.data[,'Location'] <- as.factor(class.dataB[,'Location'])
+cliR.task = makeClassifTask(data = cliR.data,target = c("recur"),positive="YR")
+
+# 2. fast tuning
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("~/survival_analysis/prauc.R")
+parallelSource("~/survival_analysis/cutoff.R")
+
+lrn = makeFilterWrapper(makeLearner("classif.gbm",predict.type = "prob"), fw.method = "cutoff")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(400,500,600)),
+                  makeDiscreteParam("shrinkage", values = c(0.1)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(10)),
+                  makeDiscreteParam("bag.fraction", values = c(0.8)),
+                  makeDiscreteParam("fw.abs", values = c(8:12))
+
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=400L,stratify = TRUE)
+res = tuneParams(lrn, task = cliR.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(prauc,auc,fpr,fnr))
+
+parallelStop()
+
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("~/survival_analysis/prauc.R")
+parallelSource("~/survival_analysis/cutoff.R")
+set.seed(14325)
+
+lrn = makeFilterWrapper(makeLearner("classif.gbm",predict.type = "prob"), fw.method = "cutoff")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      makeResampleDesc("RepCV",folds=3L,reps=100L,stratify = TRUE),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(400,500,600)),
+                        makeDiscreteParam("shrinkage", values = c(0.1)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(10)),
+                        makeDiscreteParam("bag.fraction", values = c(0.8)),
+                        makeDiscreteParam("fw.abs", values  = c(6:13))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+r = resample(lrn1, cliR.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L,stratify = TRUE,predict="both"),
+             extract=getTuneResult, 
+             models = T, measures = list(auc,prauc))
+
+parallelStop()
+
+#cla.cliran.r.fw = r
+#save(cla.cliran.r.fw ,file="classification_clinic_radio_FW.ABS.RData")
+cla.cliran.r = r
+save(cla.cliran.r ,file="classification_clinic_radio_YRasPositive.RData")
+
+feaNO.summary = unlist(lapply(r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+# 1. test the number of features included fw.abs = c(6:18)
+feaNO.summary
+  6   7   9  10  11  12  13  14  15  16  17  18 
+ 33   1  68 364 503 115 323  51  13   2  11  16
+# comment: we decide to use 6:14 
+# 2. Final
+feaNO.summary
+  6   7   9  10  11  12  13 
+ 34   1  87 371 516 121 370  
+```
+```{r C classification radiomic }
+load("~/classification/classification_feature_selection_nmin10_1000rounds.RData")
+FTC.name = names(sort(table(unlist(feaC.list)),decreasing = T))[-197]
+
+# 1. data preparation
+R.data = class.dataA[,c("recur",FTC.name)]
+R.task = makeClassifTask(data = R.data,target = c("recur"),positive="YR")
+
+# 2. fast tuning
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("~/survival_analysis/prauc.R")
+parallelSource("~/survival_analysis/cutoff.R")
+
+lrn = makeFilterWrapper(makeLearner("classif.gbm",predict.type = "prob"), fw.method = "cutoff")
+ps = makeParamSet(
+                  makeDiscreteParam("n.trees", values = c(400,500,600)),
+                  makeDiscreteParam("shrinkage", values = c(0.1)),
+                  makeDiscreteParam("interaction.depth", values = c(1)),
+                  makeDiscreteParam("n.minobsinnode", values = c(10)),
+                  makeDiscreteParam("bag.fraction", values = c(0.8)),
+                  makeDiscreteParam("fw.abs", values = c(8:12))
+
+                  )
+ctrl = makeTuneControlGrid()
+rdesc=makeResampleDesc("RepCV",folds=3L,reps=400L,stratify = TRUE)
+res = tuneParams(lrn, task = R.task, resampling =
+rdesc, par.set = ps, control = ctrl, measures = list(auc,prauc,fpr,fnr))
+
+parallelStop()
+
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+parallelLibrary("mlr")
+parallelLibrary("PRROC")
+parallelSource("~/survival_analysis/prauc.R")
+parallelSource("~/survival_analysis/cutoff.R")
+set.seed(14325)
+
+lrn = makeFilterWrapper(makeLearner("classif.gbm",predict.type = "prob"), fw.method = "cutoff")
+lrn1 = makeTuneWrapper(lrn, 
+                      #resampling = makeFixedHoldoutInstance(train.inds = 1:50, test.inds = 1:50, size = 50),
+                      makeResampleDesc("RepCV",folds=3L,reps=100L,stratify = TRUE),
+                      par.set = makeParamSet(
+                        makeDiscreteParam("n.trees", values = c(400,500,600)),
+                        makeDiscreteParam("shrinkage", values = c(0.1)),
+                        makeDiscreteParam("interaction.depth", values = c(1)),
+                        makeDiscreteParam("n.minobsinnode", values = c(10)),
+                        makeDiscreteParam("bag.fraction", values = c(0.8)),
+                        makeDiscreteParam("fw.abs", values  = c(2:9))
+                      ), 
+                      control = makeTuneControlGrid(), 
+                      show.info = T)
+
+r = resample(lrn1, R.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L,stratify = TRUE, predict = "both"),
+             extract=getTuneResult, 
+             models = T, measures = list(auc,prauc))
+
+parallelStop()
+
+cla.ran.r = r
+save(cla.ran.r,file="classification_radio_YRasPositive.RData")
+
+feaNO.summary = unlist(lapply(r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+
+# result
+feaNO.summary
+  2   3   5   6   7   8   9 
+ 11   2  34 508 464 202 279 
+```
+## Part 4: comment and what I learned about the model
+```{r pipeline}
+1. with small dataset, it is better to determine features firstly, or you will not get good result whatever method you use. Here, I consulted zheng and he said that I can wrap{univariate+ correlation + forward selection} to select features based on the frequency showed up. Firstly, I doubted this ways since it indirectly uses all samples to select features, but zheng said that it is OK and people feel more reasonable in this than using the whole dataset. I tried to put forward selection with parameter tuning and not good. Better put all feature selection part in the first part and wrapped with a resample, just for determining final features used. 
+2. Always start with the best algorithm and method at the very beginning. I wasted a lot of time for those presentation. 
+3. Including number of variable as a parameter tuned is a great idea.
+4. sffs performs better than regular forward selection
+5. Chaning the mmce with auc in feature selection would increase the performance from 0.69 to 0.744. The stratified resampling could improve the performance for all feature set. It seems that the stratified resampling would not change much for the initial feature selection. SDA selects almost the same feature set as lda and its best performance is 0.740. SDA can select feature by itself and thus here we would go directly to those advanced algorithms like gbm or randomForest to be consistent with the work in regression part. The tuning process of SVM is essential to its performance, C=100 and sigma as 0.1 seem to be the best choice. Even with this, the best performance just reaches 0.74.
+6. When it comes to tuning of hyperparameters, do pre-fast-tuning. The reason is that the algorithm would always pick up those parameters giving the best performance on inner test dataset. If a range is always being picked up, there is no need for us to tune values outside of this range. Just save time. Then how would we apply our model to new dataset and predict on new dataset? You can use a nested structure, the outer resampling is just the hold out method. The inner sampling could be CV.
+7. For nested resampling, the pre-fast-tuning in fact utilize the information of the outer test dataset in so many round of resmapling. So the best way for machine learning is still, outer to be held out and inner to be CV.
+
+```
+```{r technical issues}
+1. Rstudio sometimes can not handle parallel proprecessing, you would like to switch to R
+2. sometimes, gbm will not work with variables being too simple, like factor or just 0/1, converting into dummy variables helps less. People online said that this could be an issue of memory leak in gbm package. Some people get this around by using caret package. Here, we just convert T into numeric and give it some variabilites; Here, I didn not convert factors into dummy variables. Two reasons: 1. easy to explain 2: factors with some category too few number. [I think there is a known issue of memory leak in gbm package.]
+3. With fast-tuning, you can get some idea about ranges of tuned parameters and the gerneral performance beforehand. Tuning with few iteration would be meaningless. Test with enough iterations at the very beginning, you can check both mean and sd looking for iterations to be converged. I firstly checked the tuning path map and the picked up frequency of a parameter with different values. Although both can provides some instructive idea about performance on inner test dataset which guiding the tuning. There have their shortcomings. Tuning path just provide information for each iteration that might not be accurate while the parameter frequency table can not tell us how much improvement we can achieve after switching from one value to another. It could be that the improvement is minimal and reaches a plateau but still increase. We should stop at some point instead of keep increasing the parameter value. 
+4. In gbm, shrinkage, the learning rate is always combined with number of iteration, the n.trees. When you set it as 0.1, ideal range of n.trees should be below 1000. 0.01 would suit with 1000-5000. Keep increasing number of trees, you have to use 0.001. 
+5. It is okey if you meet warning like "In gbm.fit(x = x, y = y, offset = offset, distribution = distribution,: variable 2: Location has no variation.". It just happens to some resamples that all samples you take are from the same categories. No worry!
+6. parallelSource() and parallelLibrary() used to allow parallel work for you own made filter function
+7. In mlr, When you do feature selection or parameter tuning, they are specially designed for nested resampling, so both processes are both evaluated and guided by test data. If you want to only use train data to pick up features or parameters while you still want to make use of mlr, you can use the trick with "makeFixedHoldoutInstance(train.inds = trainID, test.inds = trainID, size = nrow(VarMatS))"
+9. measure auc in library mlr would be covered by auc from library pROC, so please unload pROC before using auc meansurement
+
+
+```
+```{r knowledge about methods and mlr}
+1. A random classifier gives AUC 0.5 in expectation regardless of class balance. And Ratio of 47：24 does not need to be considered as imbalance data
+2. Tuning process for gbm. Firstly, you need to specify parameter "disctribution", either bernoulli or adaboost is fine and bernoulli is recommended. (Comparison in practice tells me no difference). "shrinkage" and ntrees are tuned together, that shrinkage as 0.01 while ntrees is 500. Then, I tune interaction.depth and n.minobsinnode, the latter affects more. This time, a large n.minobsinnode is found to be better. However, the value of n.minobsinnode is confined by the n.train*bag.fraction. So I tune both n.minobsinnode and bag.fraction together and find 10 and 0.5 is better. After that, I came back and tune ntree and shrinkage again and find better result could be got setting a large iteration number. Then, I try using the best parameter set in initial filtering and the performance continues to be improved. I finally just use n.minobsinnode =10 which will also gives me that better result while more suitable for publication.
+3. Tuning of xgboost( the performance based on gbm features is not good and inital feature selection by itself is too slow. According to records by people before, xgboost would improve a little bit than gbm, obviously not worth spending so much time here)
+   First: nrounds and eta
+   Second: max-depth and min_child_weight
+   Third: gamma and lambda
+   Fourth: subsmaple and colsample_bytree
+
+
+```
+## Part 5: publication
+```{r evaluate features for forestplot}
+load("../InterData/regression_feature_selection_nmin4.RData")
+reg.name = names(sort(table(unlist(fea.list)),decreasing = T))[1:6]
+surv.data = data.frame(DepMat[,c(2,4,6:9,11)],VarMatS[,reg.name])
+surv.data[,'T'] <- as.factor(surv.data[,'T'])
+surv.data[,'Location'] <- as.factor(surv.data[,'Location'])
+surv.data[,'Resection'] <- ifelse(surv.data[,'Resection']=="Y",1,0)
+
+# feature names
+# "Gender","Location","T","N","Resection","wavelet_HLL_glszm_LargeAreaLowGrayLevelEmphasis" 
+# "wavelet_LLH_glszm_LargeAreaHighGrayLevelEmphasis","original_shape_Maximum2DDiameterRow"             
+# "wavelet_LLL_ngtdm_Busyness","wavelet_HLL_firstorder_Skewness","wavelet_HLL_firstorder_Mean"
+surv.task = makeSurvTask(data = surv.data[,c("OS_Dx","Event","Resection")], target = c("OS_Dx","Event")) # Change the feature used
+
+# model
+set.seed(14325,"L'Ecuyer-CMRG")
+parallelStartSocket(40)
+clusterSetRNGStream(iseed=14325)
+lrn = makeLearner("surv.gbm", par.vals = list(n.trees=50, shrinkage=1e-04, interaction.depth=1, n.minobsinnode=3,bag.fraction=1))
+
+r = resample(lrn, surv.task, 
+             resampling = makeResampleDesc("RepCV",folds=3L,reps=500L,predict="both"),
+             models = T)
+parallelStop()
+
+coef.est_18 = c(0.5046, 0.4961, 0.4858, 0.4726, 0.6026, 0.5134, 0.5729, 0.5991, 0.5401, 0.5712, 0.572)
+coef.sd = c(0.05537, 0.04447, 0.05026, 0.04397, 0.04282, 0.06439, 0.05753, 0.05313, 0.06008, 0.06047, 0.06576)
+lower_18 = coef.est_18 - 1.96*coef.sd
+upper_18 = coef.est_18 + 1.96*coef.sd
+IC_18 = c("Gender","Location","T","N","Resection",reg.name)
+
+pdf("Regression_features_forestplot.pdf",height=3,width=8,onefile=F)
+forestplot(IC_18, coef.est_18, lower=lower_18, upper=upper_18,
+           boxsize=0.4, xticks=c(0.3,0.4,0.6,0.8),zero=0.5,
+           col=fpColors(box="royalblue",line="darkblue", zero = "gray50"),
+           txt_gp=fpTxtGp(label=gpar(cex=0.8)),xlab="Concordance Index")
+dev.off()
+
+# Comment: one feature can be very useful using all dataset and might suffer when testing in cross-validation
+```
+```{r Regression}
+library("forestplot")
+# 0.load in dataset
+load("../ResultData/regression/regression_clinic.RData")
+load("../ResultData/regression/regression_radio.RData")
+load("../ResultData/regression/regression_clinic_radio.RData")
+# 1. scatter plot with error bar as standard deviation
+perf.mean = c(
+              mean(reg.cli.r$measures.test$cindex),
+              mean(reg.ran.r$measures.test$cindex),
+              mean(reg.cliran.r$measures.test$cindex)
+)
+perf.sd = c(
+            sd(reg.cli.r$measures.test$cindex),
+            sd(reg.ran.r$measures.test$cindex),
+            sd(reg.cliran.r$measures.test$cindex)
+)
+
+pdf("regression_CI.pdf",width = 5,height=5)
+plot(1:3, perf.mean,
+    ylim=range(0,1),
+    pch=19, ylab="Mean of concordance index +/- SD",
+    main="Scatter plot with std.dev error bars"
+)
+arrows(1:3, perf.mean-perf.sd, 1:3, perf.mean+perf.sd, length=0.05, angle=90, code=3)
+dev.off()
+
+# 2. forestplot for model with high frequency
+# how many features give the best model
+feaNO.summary = unlist(lapply(reg.ran.r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+feaNO.summary = unlist(lapply(reg.cliran.r$extract,function(m){m$x$fw.abs}))
+table(feaNO.summary)
+# comment: 6 features and they are 
+reg.name = names(sort(table(unlist(fea.list)),decreasing = T))[1:6]
+
+# [1] "wavelet_HLL_glszm_LargeAreaLowGrayLevelEmphasis"  "wavelet_LLH_glszm_LargeAreaHighGrayLevelEmphasis" "original_shape_Maximum2DDiameterRow"             
+# [4] "wavelet_LLL_ngtdm_Busyness"                       "wavelet_HLL_firstorder_Skewness"                  "wavelet_HLL_firstorder_Mean"   
+
+coef.est_18 = c(all_feature_CI[[1]][10], all_feature_CI[[2]][1,10], all_feature_CI[[3]][1,10],
+                all_feature_CI[[4]][10], all_feature_CI[[5]][10], uni_radio[match(reg.name,rownames(uni_radio)),10])
+storage.mode(coef.est_18) = "numeric"
+lower_18 = c(all_feature_CI[[1]][11], all_feature_CI[[2]][1,11], all_feature_CI[[3]][1,11],
+             all_feature_CI[[4]][11], all_feature_CI[[5]][11], uni_radio[match(reg.name,rownames(uni_radio)),11])
+storage.mode(lower_18) = "numeric"
+upper_18 = c(all_feature_CI[[1]][12], all_feature_CI[[2]][1,12], all_feature_CI[[3]][1,12],
+             all_feature_CI[[4]][12], all_feature_CI[[5]][12], uni_radio[match(reg.name,rownames(uni_radio)),12])
+storage.mode(upper_18) = "numeric"
+IC_18 = c("Gender","Location","T","N","Resection",reg.name)
+
+pdf("Regression_features_forestplot.pdf",height=3,width=8,onefile=F)
+forestplot(IC_18, coef.est_18, lower=lower_18, upper=upper_18,
+           boxsize=0.4, xticks=c(0.3,0.4,0.6,0.8),zero=0.5,
+           col=fpColors(box="royalblue",line="darkblue", zero = "gray50"),
+           txt_gp=fpTxtGp(label=gpar(cex=0.8)),xlab="Concordance Index")
+dev.off()
+
+```
+```{r Classification}
+# 0.load in dataset
+load("../ResultData/classification/classification_clinic_YRasPositive.RData")
+load("../ResultData/classification/classification_radio_YRasPositive.RData")
+load("../ResultData/classification/classification_clinic_radio_YRasPositive.RData")
+# 1. scatter plot with error bar as standard deviation
+perf.mean = c(
+              mean(cla.cli.r$measures.test$auc),
+              mean(cla.cli.r$measures.test$prauc),
+
+              mean(cla.ran.r$measures.test$auc),
+              mean(cla.ran.r$measures.test$prauc),
+              
+              mean(cla.cliran.r$measures.test$auc),
+              mean(cla.cliran.r$measures.test$prauc)
+)
+perf.sd = c(
+              sd(cla.cli.r$measures.test$auc),
+              sd(cla.cli.r$measures.test$prauc),
+
+              sd(cla.ran.r$measures.test$auc),
+              sd(cla.ran.r$measures.test$prauc),
+              
+              sd(cla.cliran.r$measures.test$auc),
+              sd(cla.cliran.r$measures.test$prauc)
+)
+
+pdf("classification_CI.pdf",width = 5,height=5)
+plot(1:6, perf.mean,
+    ylim=range(0,1),
+    xaxt = "n",
+    pch=19, ylab="Mean of AUC and PRAUC +/- SD",
+    main="Scatter plot with std.dev error bars",
+    col=c("black","red","black","red","black","red")
+)
+arrows(1:6, perf.mean-perf.sd, 1:6, perf.mean+perf.sd, length=0.05, angle=90, code=3,col=c("black","red","black","red","black","red"))
+axis(1, at=1:6, labels=c("AUC","PRAUC","AUC","PRAUC","AUC","PRAUC"))
+dev.off()
+
+```
+
+
+
+
+
+
+
+
+
+
